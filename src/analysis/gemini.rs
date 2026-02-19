@@ -71,36 +71,40 @@ struct IntentResponse {
     need_summary: String,
 }
 
-const SYSTEM_PROMPT: &str = r#"You are a lead identification system for real estate developer Telegram channels. You analyze comments to find people who are genuinely looking to BUY property, need a specific service, or have a real problem that a sales team could help with.
+const SYSTEM_PROMPT: &str = r#"You are a B2B lead identification system. You analyze comments in Russian real estate developer Telegram channels to find BUSINESS OWNERS, entrepreneurs, marketers, and executives who could benefit from a "smart Telegram monitoring" service — a tool that automatically scans Telegram channels, finds leads, and analyzes audience activity.
 
-IMPORTANT: Most questions and comments are NOT leads. A lead is someone who shows real buying intent or a concrete need that can be addressed by a sales team. Curiosity, general discussion, jokes, opinions — these are NOT leads.
+The service helps businesses: find clients in Telegram, monitor competitors, track brand mentions, automate lead generation from public channels.
 
-Intent categories:
-- problem: Person describes a real problem with a purchase, apartment, mortgage, delivery dates, defects
-- question: Person asks a general or informational question (NOT a lead by default)
-- help_request: Person explicitly looking for help with buying, choosing an apartment, mortgage, trade-in
-- complaint: Person expresses dissatisfaction with quality, service, management company
-- buying_intent: Person shows clear interest in purchasing — asks about prices, availability, specific layouts, start of sales, booking
-- feedback: Person gives feedback or suggestions, shares experience
-- neutral: General comment, reaction, meme, emoji, no actionable need
-- spam: Spam, ads, bots, irrelevant
+IMPORTANT: Regular apartment buyers, tenants, and individuals are NOT leads. You are looking for people who represent a business or have a business problem that Telegram monitoring could solve.
 
-Lead identification — be STRICT:
-- is_lead=true ONLY for:
-  - buying_intent: person is actively looking to buy or asking about specific properties/prices/availability
-  - help_request: person explicitly needs help choosing, buying, getting a mortgage
-  - problem: person has a concrete problem that a sales/support team can resolve
-- is_lead=false for:
-  - question: general curiosity, asking about news, neighborhood, infrastructure (NOT a lead)
-  - complaint: venting without seeking resolution (NOT a lead unless asking for help)
-  - feedback, neutral, spam: never leads
+Intent categories (classify the comment's primary intent):
+- business_owner: Person identifies as owner, co-founder, CEO, entrepreneur, runs a business or agency
+- marketer: Person works in marketing, sales, lead generation, CRM, advertising — mentions campaigns, funnels, conversions
+- realtor_agency: Person is a realtor, broker, or represents a real estate agency — sells or rents multiple properties
+- investor: Person buys multiple properties, manages a portfolio, discusses investment at scale
+- it_business: Person builds products, works in tech, SaaS, automation — could be a partner or referral
+- pain_signal: Person expresses a clear business pain that Telegram monitoring could solve (e.g. "can't find clients", "need to track competitors", "tired of manual monitoring")
+- individual: Regular person — buying/renting for themselves, discussing their own apartment
+- neutral: General comment, reaction, no business context
+- spam: Spam, bots, ads
 
-- lead_score: 0.0-1.0 reflecting buying intent strength
-  - 0.8-1.0: Asking about specific apartment/price/availability, ready to buy, asking how to book
-  - 0.5-0.7: Interested in buying but early stage — asking about start of sales, comparing options
-  - 0.3-0.5: Has a problem that could lead to a new purchase (e.g. quality issues, wants to move)
-  - 0.0-0.2: Not a lead
-- need_summary: One sentence in Russian describing what the person needs (empty string if not a lead)
+Lead identification — be STRICT. is_lead=true ONLY when:
+1. Person is clearly a business owner, marketer, agency owner, or entrepreneur (not an individual)
+2. OR person expresses a pain point that Telegram monitoring directly solves
+
+is_lead=false for:
+- Individuals buying/renting for personal use
+- Residents complaining about their apartment
+- General questions about infrastructure, prices for personal purchase
+- Neutral reactions, jokes, emojis
+
+lead_score: 0.0-1.0 reflecting fit for the Telegram monitoring service:
+- 0.8-1.0: Business owner or marketer explicitly discussing lead generation, client acquisition, competitor monitoring, or automation in Telegram
+- 0.5-0.7: Realtor/agency or entrepreneur who likely needs client acquisition tools
+- 0.3-0.5: Investor at scale or person with a pain signal around finding clients/monitoring
+- 0.0-0.2: Individual, not a business lead
+
+need_summary: One sentence in Russian describing the person's business role and potential need (empty string if not a lead)
 
 Respond ONLY with JSON:
 {"intent": "<category>", "confidence": <0.0-1.0>, "is_lead": <true/false>, "lead_score": <0.0-1.0>, "need_summary": "<string>"}"#;
@@ -193,13 +197,30 @@ impl GeminiAnalyzer {
             },
         };
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .context("Gemini API request failed")?;
+        let mut attempt = 0u32;
+        let max_retries = 4u32;
+        let response = loop {
+            let resp = self
+                .client
+                .post(&url)
+                .json(&request)
+                .send()
+                .await
+                .context("Gemini API request failed")?;
+
+            if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                break resp;
+            }
+
+            let _ = resp.text().await; // drain body
+            if attempt >= max_retries {
+                anyhow::bail!("Gemini API 429 after {} retries", max_retries);
+            }
+            let wait_secs = 5u64 * 2u64.pow(attempt);
+            warn!("Gemini 429, retry {}/{} in {}s", attempt + 1, max_retries, wait_secs);
+            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+            attempt += 1;
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -226,12 +247,13 @@ impl GeminiAnalyzer {
             serde_json::from_str(text).context("Failed to parse intent JSON from Gemini")?;
 
         let intent = match parsed.intent.to_lowercase().as_str() {
-            "problem" => Intent::Problem,
-            "question" => Intent::Question,
-            "help_request" => Intent::HelpRequest,
-            "complaint" => Intent::Complaint,
-            "buying_intent" => Intent::BuyingIntent,
-            "feedback" => Intent::Feedback,
+            "business_owner" => Intent::BusinessOwner,
+            "marketer" => Intent::Marketer,
+            "realtor_agency" => Intent::RealtorAgency,
+            "investor" => Intent::Investor,
+            "it_business" => Intent::ItBusiness,
+            "pain_signal" => Intent::PainSignal,
+            "individual" => Intent::Individual,
             "spam" => Intent::Spam,
             _ => Intent::Neutral,
         };

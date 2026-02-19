@@ -8,6 +8,7 @@ use crate::analysis::{AnalyzedComment, Intent};
 pub struct AppState {
     pub tx: broadcast::Sender<AnalyzedComment>,
     pub recent: Arc<RwLock<Vec<AnalyzedComment>>>,
+    pub leads: Arc<RwLock<Vec<AnalyzedComment>>>,
     pub stats: Arc<RwLock<Stats>>,
     pub buffer_size: usize,
 }
@@ -24,6 +25,7 @@ impl AppState {
         Self {
             tx,
             recent: Arc::new(RwLock::new(Vec::with_capacity(buffer_size))),
+            leads: Arc::new(RwLock::new(Vec::new())),
             stats: Arc::new(RwLock::new(Stats::default())),
             buffer_size,
         }
@@ -37,6 +39,12 @@ impl AppState {
                 stats.leads += 1;
             }
             *stats.by_intent.entry(comment.intent).or_insert(0) += 1;
+        }
+
+        if comment.is_lead {
+            let mut leads = self.leads.write().await;
+            leads.push(comment.clone());
+            leads.sort_by(|a, b| b.lead_score.partial_cmp(&a.lead_score).unwrap_or(std::cmp::Ordering::Equal));
         }
 
         {

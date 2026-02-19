@@ -6,7 +6,8 @@ use grammers_tl_types as tl;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tokio::time::timeout;
+use tracing::{error, info, warn};
 
 use crate::config::TelegramConfig;
 use super::types::RawComment;
@@ -17,10 +18,17 @@ pub struct TelegramScraper {
     poll_interval: std::time::Duration,
     /// Tracks the last seen comment ID per (channel, post_id) to avoid duplicates
     seen: HashMap<(String, i32), i32>,
+    /// Cache: channel_name → has linked discussion group (comments enabled)
+    channel_has_comments: HashMap<String, bool>,
+    /// Sends (channel_name, has_comments) to storage for channels.json
+    channel_status_tx: mpsc::Sender<(String, bool)>,
 }
 
 impl TelegramScraper {
-    pub async fn connect(config: &TelegramConfig) -> Result<Self> {
+    pub async fn connect(
+        config: &TelegramConfig,
+        channel_status_tx: mpsc::Sender<(String, bool)>,
+    ) -> Result<Self> {
         let session = Arc::new(MemorySession::default());
 
         let pool = grammers_client::sender::SenderPool::new(
@@ -47,6 +55,8 @@ impl TelegramScraper {
             channels: config.channels.clone(),
             poll_interval: std::time::Duration::from_secs(config.poll_interval_secs),
             seen: HashMap::new(),
+            channel_has_comments: HashMap::new(),
+            channel_status_tx,
         })
     }
 
@@ -85,8 +95,12 @@ impl TelegramScraper {
 
         loop {
             for channel_name in &self.channels.clone() {
-                if let Err(e) = self.poll_channel(channel_name, &tx).await {
-                    error!("Error polling channel {}: {:#}", channel_name, e);
+                info!("Polling @{}", channel_name);
+                let poll_future = self.poll_channel(channel_name, &tx);
+                match timeout(std::time::Duration::from_secs(300), poll_future).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => error!("Error polling @{}: {:#}", channel_name, e),
+                    Err(_) => error!("Global timeout polling @{} (>300s), skipping", channel_name),
                 }
             }
 
@@ -95,29 +109,72 @@ impl TelegramScraper {
     }
 
     async fn poll_channel(&mut self, channel_name: &str, tx: &mpsc::Sender<RawComment>) -> Result<()> {
-        let channel = self
-            .client
-            .resolve_username(channel_name)
-            .await?
-            .context(format!("Channel @{} not found", channel_name))?;
+        let channel = timeout(
+            std::time::Duration::from_secs(15),
+            self.client.resolve_username(channel_name),
+        )
+        .await
+        .context("Timeout resolving channel username")?
+        .context(format!("Channel @{} not found", channel_name))?
+        .context(format!("Channel @{} not found", channel_name))?;
 
-        let peer_ref = channel
-            .to_ref()
-            .await
-            .context("Cannot get peer ref for channel")?;
+        let peer_ref = timeout(
+            std::time::Duration::from_secs(10),
+            channel.to_ref(),
+        )
+        .await
+        .context("Timeout getting peer ref")?
+        .context("Cannot get peer ref for channel")?;
+
+        // Check once per channel if it has a linked discussion group
+        let has_comments = if let Some(&cached) = self.channel_has_comments.get(channel_name) {
+            cached
+        } else {
+            let result = self.check_has_comments(peer_ref.clone()).await;
+            info!("Channel @{}: comments enabled = {}", channel_name, result);
+            self.channel_has_comments.insert(channel_name.to_string(), result);
+            let _ = self.channel_status_tx.send((channel_name.to_string(), result)).await;
+            result
+        };
+
+        if !has_comments {
+            return Ok(());
+        }
 
         // Get recent messages (posts) from the channel
-        let mut messages = self.client.iter_messages(peer_ref.clone()).limit(20);
+        let mut messages = self.client.iter_messages(peer_ref.clone()).limit(200);
 
         let mut posts = Vec::new();
-        while let Some(msg) = messages.next().await? {
+        while let Some(msg) = timeout(std::time::Duration::from_secs(15), messages.next())
+            .await
+            .context("Timeout fetching messages")?
+            .context("Error fetching messages")?
+        {
             posts.push(msg);
         }
 
         for post in &posts {
             let post_id = post.id();
 
-            if let Ok(mut reply_messages) = self.get_replies(peer_ref.clone(), post_id).await {
+            let replies_result = timeout(
+                std::time::Duration::from_secs(5),
+                self.get_replies(peer_ref.clone(), post_id),
+            )
+            .await;
+
+            let reply_messages_opt = match replies_result {
+                Ok(Ok(msgs)) => Some(msgs),
+                Ok(Err(e)) => {
+                    warn!("Error getting replies for post {} in {}: {:#}", post_id, channel_name, e);
+                    None
+                }
+                Err(_) => {
+                    warn!("Timeout getting replies for post {} in {}", post_id, channel_name);
+                    None
+                }
+            };
+
+            if let Some(mut reply_messages) = reply_messages_opt {
                 let last_seen = self
                     .seen
                     .get(&(channel_name.to_string(), post_id))
@@ -158,6 +215,36 @@ impl TelegramScraper {
         Ok(())
     }
 
+    async fn check_has_comments(&self, peer_ref: grammers_session::types::PeerRef) -> bool {
+        let input_peer: tl::enums::InputPeer = peer_ref.into();
+        let input_channel = match input_peer {
+            tl::enums::InputPeer::Channel(c) => {
+                tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                    channel_id: c.channel_id,
+                    access_hash: c.access_hash,
+                })
+            }
+            _ => return false,
+        };
+
+        let request = tl::functions::channels::GetFullChannel { channel: input_channel };
+
+        match timeout(std::time::Duration::from_secs(10), self.client.invoke(&request)).await {
+            Ok(Ok(tl::enums::messages::ChatFull::Full(full))) => match full.full_chat {
+                tl::enums::ChatFull::ChannelFull(cf) => cf.linked_chat_id.is_some(),
+                _ => false,
+            },
+            Ok(Err(e)) => {
+                warn!("GetFullChannel error: {:#}", e);
+                false
+            }
+            Err(_) => {
+                warn!("GetFullChannel timeout");
+                false
+            }
+        }
+    }
+
     async fn get_replies(
         &self,
         peer_ref: grammers_session::types::PeerRef,
@@ -177,7 +264,16 @@ impl TelegramScraper {
             hash: 0,
         };
 
-        let response = self.client.invoke(&request).await?;
+        let response = match self.client.invoke(&request).await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("MSG_ID_INVALID") || msg.contains("CHANNEL_PRIVATE") {
+                    return Ok(vec![]);
+                }
+                return Err(e.into());
+            }
+        };
 
         let mut results = Vec::new();
 

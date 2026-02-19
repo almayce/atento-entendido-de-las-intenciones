@@ -28,8 +28,11 @@ async fn main() -> Result<()> {
     // App state for web
     let app_state = web::state::AppState::new(analyzed_tx.clone(), config.web.recent_buffer_size);
 
+    // Channel status: scraper → storage (for channels.json)
+    let (channel_status_tx, channel_status_rx) = mpsc::channel::<(String, bool)>(64);
+
     // Storage writer
-    let storage_writer = storage::StorageWriter::new(&config.storage);
+    let storage_writer = storage::StorageWriter::new(&config.storage, channel_status_rx);
     let storage_rx = analyzed_tx.subscribe();
 
     // Web state updater
@@ -40,7 +43,7 @@ async fn main() -> Result<()> {
     let analyzer = Arc::new(analysis::GeminiAnalyzer::new(&config.gemini));
 
     // Telegram scraper
-    let scraper = telegram::TelegramScraper::connect(&config.telegram).await?;
+    let scraper = telegram::TelegramScraper::connect(&config.telegram, channel_status_tx).await?;
 
     // Spawn tasks
     let scraper_handle = tokio::spawn(async move {

@@ -32,17 +32,15 @@ struct CommentView {
 
 pub async fn dashboard(State(state): State<AppState>) -> Html<String> {
     let recent = state.recent.read().await;
+    let leads = state.leads.read().await;
     let stats = state.stats.read().await;
 
-    // Leads first, then by date descending
-    let mut sorted: Vec<_> = recent.iter().collect();
-    sorted.sort_by(|a, b| {
-        b.is_lead.cmp(&a.is_lead)
-            .then(b.lead_score.partial_cmp(&a.lead_score).unwrap_or(std::cmp::Ordering::Equal))
-            .then(b.date.cmp(&a.date))
-    });
+    // Show all leads first (from dedicated leads buffer), then recent non-lead comments
+    let lead_views: Vec<_> = leads.iter().collect();
+    let recent_non_leads: Vec<_> = recent.iter().filter(|c| !c.is_lead).collect();
+    let combined: Vec<_> = lead_views.into_iter().chain(recent_non_leads).collect();
 
-    let comments: Vec<CommentView> = sorted
+    let comments: Vec<CommentView> = combined
         .iter()
         .map(|c| CommentView {
             is_lead: c.is_lead,
